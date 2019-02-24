@@ -92,7 +92,7 @@ sub0_ctx_recv(void *arg, nni_aio *aio)
 {
 	sub0_ctx * ctx  = arg;
 	sub0_sock *sock = ctx->sock;
-	nng_msg *  msg;
+	nni_msg *  msg;
 
 	if (nni_aio_begin(aio) != 0) {
 		return;
@@ -373,13 +373,13 @@ sub0_recv_cb(void *arg)
 	nni_aio_set_msg(p->aio_recv, NULL);
 	nni_msg_set_pipe(msg, nni_pipe_id(p->pipe));
 
-	body = nng_msg_body(msg);
-	len  = nng_msg_len(msg);
+	body = nni_msg_body(msg);
+	len  = nni_msg_len(msg);
 
 	nni_mtx_lock(&sock->lk);
 	// Go through all contexts.  We will try to send up.
 	NNI_LIST_FOREACH (&sock->ctxs, ctx) {
-		nng_msg *dup;
+		nni_msg *dup;
 
 		if (ctx->recvqlen == ctx->recvqcap) {
 			// Cannot deliver here, as receive buffer is full.
@@ -431,13 +431,69 @@ sub0_recv_cb(void *arg)
 	nni_pipe_recv(p->pipe, p->aio_recv);
 }
 
+static int
+sub0_ctx_get_recvbuf(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	sub0_ctx * ctx  = arg;
+	sub0_sock *sock = ctx->sock;
+	size_t     val;
+	nni_mtx_lock(&sock->lk);
+	val = ctx->recvqcap;
+	nni_mtx_unlock(&sock->lk);
+
+	return (nni_copyout_size(val, buf, szp, t));
+}
+
+static int
+sub0_ctx_set_recvbuf(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	sub0_ctx * ctx  = arg;
+	sub0_sock *sock = ctx->sock;
+	nni_msg ** recvq;
+	size_t     val;
+	int        rv;
+
+	if ((rv = nni_copyin_size(&val, buf, sz, 1, 8192, t)) != 0) {
+		return (rv);
+	}
+	nni_mtx_lock(&sock->lk);
+	if ((recvq = nni_alloc(sizeof(nni_msg *) * val)) == NULL) {
+		nni_mtx_unlock(&sock->lk);
+		return (NNG_ENOMEM);
+	}
+	// For simplicity's sake, we just discard any undelivered messages.
+	// We could in the future try to move them, and keep them here, but
+	// we would need to cope with shrinking the queue, and frankly, its
+	// easiest to just discard.
+	for (size_t idx = ctx->recvqget; idx != ctx->recvqput; idx++) {
+		if (idx >= ctx->recvqcap) {
+			idx = 0;
+		}
+		nni_msg_free(ctx->recvq[idx]);
+	}
+	nni_free(ctx->recvq, ctx->recvqcap * sizeof(nni_msg *));
+	ctx->recvq    = recvq;
+	ctx->recvqcap = val;
+	ctx->recvqput = 0;
+	ctx->recvqget = 0;
+	ctx->recvqlen = 0;
+
+	// If we change the socket, then this will change the queue for
+	// any new contexts. (Previously constructed contexts are unaffected.)
+	if (sock->ctx == ctx) {
+		sock->recvbuflen = val;
+	}
+	nni_mtx_unlock(&sock->lk);
+	return (0);
+}
+
 // For now we maintain subscriptions on a sorted linked list.  As we do not
 // expect to have huge numbers of subscriptions, and as the operation is
 // really O(n), we think this is acceptable.  In the future we might decide
 // to replace this with a patricia trie, like old nanomsg had.
 
 static int
-sub0_ctx_subscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
+sub0_ctx_subscribe(void *arg, const void *buf, size_t sz, nni_type t)
 {
 	sub0_ctx *  ctx  = arg;
 	sub0_sock * sock = ctx->sock;
@@ -473,7 +529,7 @@ sub0_ctx_subscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
 }
 
 static int
-sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
+sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_type t)
 {
 	sub0_ctx *  ctx  = arg;
 	sub0_sock * sock = ctx->sock;
@@ -500,18 +556,18 @@ sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
 	// Now we need to make sure that any messages that are waiting still
 	// match the subscription.
 	for (idx = ctx->recvqget; idx != ctx->recvqput; idx++) {
-		nng_msg *msg;
+		nni_msg *msg;
 		size_t   src, dst;
 
 		if (idx >= ctx->recvqcap) {
 			idx = 0;
 		}
 		msg = ctx->recvq[idx];
-		if (sub0_matches(ctx, nng_msg_body(msg), nng_msg_len(msg))) {
+		if (sub0_matches(ctx, nni_msg_body(msg), nni_msg_len(msg))) {
 			continue;
 		}
 
-		nng_msg_free(msg);
+		nni_msg_free(msg);
 
 		// This deletes the queued msg index, shifting all others
 		// down by one, but deals with wraparound.
@@ -533,6 +589,11 @@ sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
 }
 
 static nni_option sub0_ctx_options[] = {
+	{
+	    .o_name = NNG_OPT_RECVBUF,
+	    .o_get  = sub0_ctx_get_recvbuf,
+	    .o_set  = sub0_ctx_set_recvbuf,
+	},
 	{
 	    .o_name = NNG_OPT_SUB_SUBSCRIBE,
 	    .o_set  = sub0_ctx_subscribe,
@@ -577,14 +638,28 @@ sub0_sock_get_recvfd(void *arg, void *buf, size_t *szp, nni_opt_type t)
 }
 
 static int
-sub0_sock_subscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
+sub0_sock_get_recvbuf(void *arg, void *buf, size_t *szp, nni_type t)
+{
+	sub0_sock *sock = arg;
+	return (sub0_ctx_get_recvbuf(sock->ctx, buf, szp, t));
+}
+
+static int
+sub0_sock_set_recvbuf(void *arg, const void *buf, size_t sz, nni_type t)
+{
+	sub0_sock *sock = arg;
+	return (sub0_ctx_set_recvbuf(sock->ctx, buf, sz, t));
+}
+
+static int
+sub0_sock_subscribe(void *arg, const void *buf, size_t sz, nni_type t)
 {
 	sub0_sock *sock = arg;
 	return (sub0_ctx_subscribe(sock->ctx, buf, sz, t));
 }
 
 static int
-sub0_sock_unsubscribe(void *arg, const void *buf, size_t sz, nni_opt_type t)
+sub0_sock_unsubscribe(void *arg, const void *buf, size_t sz, nni_type t)
 {
 	sub0_sock *sock = arg;
 	return (sub0_ctx_unsubscribe(sock->ctx, buf, sz, t));
@@ -620,6 +695,11 @@ static nni_option sub0_sock_options[] = {
 	{
 	    .o_name = NNG_OPT_RECVFD,
 	    .o_get  = sub0_sock_get_recvfd,
+	},
+	{
+	    .o_name = NNG_OPT_RECVBUF,
+	    .o_get  = sub0_sock_get_recvbuf,
+	    .o_set  = sub0_sock_set_recvbuf,
 	},
 	// terminate list
 	{
