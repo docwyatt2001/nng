@@ -51,11 +51,15 @@ struct sub0_ctx {
 	nni_list      topics; // XXX: Consider replacing with patricia trie
 	nni_list      raios;  // sub context could have multiple pending recvs
 	bool          closed;
-	nni_msg **    recvq;
-	size_t        recvqcap;
-	size_t        recvqlen;
-	size_t        recvqget;
-	size_t        recvqput;
+	nni_lmq       lmq;
+
+#if 0
+	nni_msg **recvq;
+	size_t    recvqcap;
+	size_t    recvqlen;
+	size_t    recvqget;
+	size_t    recvqput;
+#endif
 };
 
 // sub0_sock is our per-socket protocol private structure.
@@ -105,7 +109,8 @@ sub0_ctx_recv(void *arg, nni_aio *aio)
 		nni_aio_finish_error(aio, NNG_ECLOSED);
 		return;
 	}
-	if (ctx->recvqlen == 0) {
+
+	if (nni_lmq_empty(&ctx->lmq)) {
 		int rv;
 		if ((rv = nni_aio_schedule(aio, sub0_ctx_cancel, ctx)) != 0) {
 			nni_mtx_unlock(&sock->lk);
@@ -117,14 +122,9 @@ sub0_ctx_recv(void *arg, nni_aio *aio)
 		return;
 	}
 
-	ctx->recvqlen--;
+	(void) nni_lmq_getq(&ctx->lmq, &msg);
 
-	msg = ctx->recvq[ctx->recvqget];
-	ctx->recvqget++;
-	if (ctx->recvqget >= ctx->recvqcap) {
-		ctx->recvqget = 0;
-	}
-	if ((ctx->recvqlen == 0) && (ctx == sock->ctx)) {
+	if (nni_lmq_empty(&ctx->lmq) && (ctx == sock->ctx)) {
 		nni_pollable_clear(sock->recvable);
 	}
 	nni_aio_set_msg(aio, msg);
@@ -176,14 +176,7 @@ sub0_ctx_fini(void *arg)
 		NNI_FREE_STRUCT(topic);
 	}
 
-	while (ctx->recvqget != ctx->recvqput) {
-		nni_msg_free(ctx->recvq[ctx->recvqget]);
-		ctx->recvqget++;
-		if (ctx->recvqget >= ctx->recvqcap) {
-			ctx->recvqget = 0;
-		}
-	}
-	nni_free(ctx->recvq, ctx->recvqcap * sizeof(nni_msg *));
+	nni_lmq_fini(&ctx->lmq);
 	NNI_FREE_STRUCT(ctx);
 }
 
@@ -193,6 +186,7 @@ sub0_ctx_init(void **ctxp, void *sarg)
 	sub0_sock *sock = sarg;
 	sub0_ctx * ctx;
 	size_t     len;
+	int        rv;
 
 	if ((ctx = NNI_ALLOC_STRUCT(ctx)) == NULL) {
 		return (NNG_ENOMEM);
@@ -201,11 +195,9 @@ sub0_ctx_init(void **ctxp, void *sarg)
 	nni_mtx_lock(&sock->lk);
 	len = sock->recvbuflen;
 
-	if ((ctx->recvq = nni_alloc(len * sizeof(nni_msg *))) == NULL) {
-		NNI_FREE_STRUCT(ctx);
-		return (NNG_ENOMEM);
+	if ((rv = nni_lmq_init(&ctx->lmq, len)) != 0) {
+		return (rv);
 	}
-	ctx->recvqcap = len;
 
 	nni_aio_list_init(&ctx->raios);
 	NNI_LIST_INIT(&ctx->topics, sub0_topic, node);
@@ -381,7 +373,7 @@ sub0_recv_cb(void *arg)
 	NNI_LIST_FOREACH (&sock->ctxs, ctx) {
 		nni_msg *dup;
 
-		if (ctx->recvqlen == ctx->recvqcap) {
+		if (nni_lmq_full(&ctx->lmq)) {
 			// Cannot deliver here, as receive buffer is full.
 			continue;
 		}
@@ -407,12 +399,7 @@ sub0_recv_cb(void *arg)
 			// Save for synchronous completion
 			nni_list_append(&finish, aio);
 		} else {
-			ctx->recvq[ctx->recvqput] = dup;
-			ctx->recvqput++;
-			ctx->recvqlen++;
-			if (ctx->recvqput >= ctx->recvqcap) {
-				ctx->recvqput = 0;
-			}
+			(void) nni_lmq_putq(&ctx->lmq, dup);
 		}
 	}
 	nni_mtx_unlock(&sock->lk);
@@ -438,7 +425,7 @@ sub0_ctx_get_recvbuf(void *arg, void *buf, size_t *szp, nni_type t)
 	sub0_sock *sock = ctx->sock;
 	size_t     val;
 	nni_mtx_lock(&sock->lk);
-	val = ctx->recvqcap;
+	val = nni_lmq_cap(&ctx->lmq);
 	nni_mtx_unlock(&sock->lk);
 
 	return (nni_copyout_size(val, buf, szp, t));
@@ -449,7 +436,6 @@ sub0_ctx_set_recvbuf(void *arg, const void *buf, size_t sz, nni_type t)
 {
 	sub0_ctx * ctx  = arg;
 	sub0_sock *sock = ctx->sock;
-	nni_msg ** recvq;
 	size_t     val;
 	int        rv;
 
@@ -457,26 +443,10 @@ sub0_ctx_set_recvbuf(void *arg, const void *buf, size_t sz, nni_type t)
 		return (rv);
 	}
 	nni_mtx_lock(&sock->lk);
-	if ((recvq = nni_alloc(sizeof(nni_msg *) * val)) == NULL) {
+	if ((rv = nni_lmq_resize(&ctx->lmq, val)) != 0) {
 		nni_mtx_unlock(&sock->lk);
-		return (NNG_ENOMEM);
+		return (rv);
 	}
-	// For simplicity's sake, we just discard any undelivered messages.
-	// We could in the future try to move them, and keep them here, but
-	// we would need to cope with shrinking the queue, and frankly, its
-	// easiest to just discard.
-	for (size_t idx = ctx->recvqget; idx != ctx->recvqput; idx++) {
-		if (idx >= ctx->recvqcap) {
-			idx = 0;
-		}
-		nni_msg_free(ctx->recvq[idx]);
-	}
-	nni_free(ctx->recvq, ctx->recvqcap * sizeof(nni_msg *));
-	ctx->recvq    = recvq;
-	ctx->recvqcap = val;
-	ctx->recvqput = 0;
-	ctx->recvqget = 0;
-	ctx->recvqlen = 0;
 
 	// If we change the socket, then this will change the queue for
 	// any new contexts. (Previously constructed contexts are unaffected.)
@@ -534,7 +504,7 @@ sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_type t)
 	sub0_ctx *  ctx  = arg;
 	sub0_sock * sock = ctx->sock;
 	sub0_topic *topic;
-	size_t      idx;
+	size_t      len;
 	NNI_ARG_UNUSED(t);
 
 	nni_mtx_lock(&sock->lk);
@@ -554,32 +524,18 @@ sub0_ctx_unsubscribe(void *arg, const void *buf, size_t sz, nni_type t)
 	nni_list_remove(&ctx->topics, topic);
 
 	// Now we need to make sure that any messages that are waiting still
-	// match the subscription.
-	for (idx = ctx->recvqget; idx != ctx->recvqput; idx++) {
+	// match the subscription.  We basically just run through the queue
+	// and requeue those messages we need.
+	len = nni_lmq_len(&ctx->lmq);
+	for (size_t i = 0; i < len; i++) {
 		nni_msg *msg;
-		size_t   src, dst;
 
-		if (idx >= ctx->recvqcap) {
-			idx = 0;
-		}
-		msg = ctx->recvq[idx];
+		(void) nni_lmq_getq(&ctx->lmq, &msg);
 		if (sub0_matches(ctx, nni_msg_body(msg), nni_msg_len(msg))) {
-			continue;
+			(void) nni_lmq_putq(&ctx->lmq, msg);
+		} else {
+			nni_msg_free(msg);
 		}
-
-		nni_msg_free(msg);
-
-		// This deletes the queued msg index, shifting all others
-		// down by one, but deals with wraparound.
-		dst = idx;
-		src = (idx + 1) % ctx->recvqcap;
-		while (src != ctx->recvqput) {
-			ctx->recvq[dst] = ctx->recvq[src];
-			dst             = src;
-			src++;
-			src %= ctx->recvqcap;
-		}
-		ctx->recvqput = dst;
 	}
 	nni_mtx_unlock(&sock->lk);
 
