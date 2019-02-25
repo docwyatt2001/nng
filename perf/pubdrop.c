@@ -47,14 +47,43 @@ nng_sub0_open(nng_socket *arg)
 
 #endif // NNG_HAVE_PUB0....
 
-static void die(const char *, ...);
-static void do_pubdrop(int argc, char **argv);
+static void         die(const char *, ...);
+static void         do_pubdrop(int argc, char **argv);
+static uint64_t     nperusec;
+static volatile int x;
+
+void
+work(void)
+{
+	x = rand();
+}
+
+void
+usdelay(unsigned long long nusec)
+{
+	nusec *= nperusec;
+	while (nusec > 0) {
+		work();
+		nusec--;
+	}
+}
 
 int
 main(int argc, char **argv)
 {
 	argc--;
 	argv++;
+
+	// We calculate a delay factor to roughly delay 1 usec.  We don't
+	// need this to be perfect, just reproducible on the same host.
+	unsigned long cnt = 1000000;
+
+	nng_time beg = nng_clock();
+	for (unsigned long i = 0; i < cnt; i++) {
+		work();
+	}
+	nng_time end = nng_clock();
+	nperusec     = cnt / (1000 * (end - beg));
 
 	do_pubdrop(argc, argv);
 }
@@ -139,7 +168,7 @@ pub_server(void *arg)
 		// It sure would be nice if we had a usec granularity option
 		// here.
 		if (pa->intvl > 0) {
-			nng_msleep((nng_duration) pa->intvl);
+			usdelay((unsigned long long) pa->intvl);
 		}
 	}
 
